@@ -18,13 +18,14 @@ from pathlib import Path
 from typing import NoReturn
 
 import discord
+import rich
 
 # Set the event loop policies here so any subsequent `new_event_loop()`
 # calls, in particular those as a result of the following imports,
 # return the correct loop object.
-from redbot import _update_event_loop_policy, __version__
+from redbot import _early_init, __version__
 
-_update_event_loop_policy()
+_early_init()
 
 import redbot.logging
 from redbot.core.bot import Red, ExitCodes
@@ -395,10 +396,12 @@ async def run_bot(red: Red, cli_flags: Namespace) -> None:
                 sys.exit(0)
         sys.exit(1)
     except discord.PrivilegedIntentsRequired:
-        print(
+        console = rich.get_console()
+        console.print(
             "Red requires all Privileged Intents to be enabled.\n"
             "You can find out how to enable Privileged Intents with this guide:\n"
-            "https://docs.discord.red/en/stable/bot_application_guide.html#enabling-privileged-intents"
+            "https://docs.discord.red/en/stable/bot_application_guide.html#enabling-privileged-intents",
+            style="red",
         )
         sys.exit(1)
 
@@ -446,13 +449,18 @@ def global_exception_handler(red, loop, context):
     """
     Logs unhandled exceptions in other tasks
     """
-    msg = context.get("exception", context["message"])
+    exc = context.get("exception")
     # These will get handled later when it *also* kills loop.run_forever
-    if not isinstance(msg, (KeyboardInterrupt, SystemExit)):
-        if isinstance(msg, Exception):
-            log.critical("Caught unhandled exception in task:\n", exc_info=msg)
-        else:
-            log.critical("Caught unhandled exception in task: %s", msg)
+    if exc is not None and isinstance(exc, (KeyboardInterrupt, SystemExit)):
+        return
+    # Maybe in the future we should handle some of the other things
+    # that the default exception handler handles, but this should work fine for now.
+    log.critical(
+        "Caught unhandled exception in %s:\n%s",
+        context.get("future", "event loop"),
+        context["message"],
+        exc_info=exc,
+    )
 
 
 def red_exception_handler(red, red_task: asyncio.Future):

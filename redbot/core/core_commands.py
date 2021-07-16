@@ -12,10 +12,12 @@ import os
 import re
 import sys
 import platform
+import psutil
 import getpass
 import pip
 import traceback
 from pathlib import Path
+from redbot.core import data_manager
 from redbot.core.utils.menus import menu, DEFAULT_CONTROLS
 from redbot.core.commands import GuildConverter
 from string import ascii_letters, digits
@@ -25,7 +27,6 @@ import aiohttp
 import discord
 from babel import Locale as BabelLocale, UnknownLocaleError
 from redbot.core.data_manager import storage_type
-from redbot.core.utils.chat_formatting import box, pagify
 
 from . import (
     __version__,
@@ -96,6 +97,8 @@ log = logging.getLogger("red")
 _ = i18n.Translator("Core", __file__)
 
 TokenConverter = commands.get_dict_converter(delims=[" ", ",", ";"])
+
+MAX_PREFIX_LENGTH = 20
 
 
 class CoreLogic:
@@ -240,7 +243,11 @@ class CoreLogic:
         for m in modules:
             maybe_reload(m)
 
-        children = {name: lib for name, lib in sys.modules.items() if name.startswith(module_name)}
+        children = {
+            name: lib
+            for name, lib in sys.modules.items()
+            if name == module_name or name.startswith(f"{module_name}.")
+        }
         for child_name, lib in children.items():
             importlib._bootstrap._exec(lib.__spec__, lib)
 
@@ -373,9 +380,12 @@ class CoreLogic:
             Invite URL.
         """
         app_info = await self.bot.application_info()
-        perms_int = await self.bot._config.invite_perm()
+        data = await self.bot._config.all()
+        commands_scope = data["invite_commands_scope"]
+        scopes = ("bot", "applications.commands") if commands_scope else None
+        perms_int = data["invite_perm"]
         permissions = discord.Permissions(perms_int)
-        return discord.utils.oauth_url(app_info.id, permissions)
+        return discord.utils.oauth_url(app_info.id, permissions, scopes=scopes)
 
     @staticmethod
     async def _can_get_invite_url(ctx):
@@ -1268,7 +1278,7 @@ class Core(commands.commands._RuleDropper, commands.Cog, CoreLogic):
 
     def _check_if_command_requires_embed_links(self, command_obj: commands.Command) -> None:
         for command in itertools.chain((command_obj,), command_obj.parents):
-            if command_obj.requires.bot_perms.embed_links:
+            if command.requires.bot_perms.embed_links:
                 # a slight abuse of this exception to save myself two lines later...
                 raise commands.UserFeedbackCheckFailure(
                     _(
@@ -1434,6 +1444,7 @@ class Core(commands.commands._RuleDropper, commands.Cog, CoreLogic):
         if enabled is None:
             await self.bot._config.user(ctx.author).embeds.clear()
             await ctx.send(_("Embeds will now fall back to the global setting."))
+            return
 
         await self.bot._config.user(ctx.author).embeds.set(enabled)
         await ctx.send(
@@ -1559,6 +1570,26 @@ class Core(commands.commands._RuleDropper, commands.Cog, CoreLogic):
         """
         await self.bot._config.invite_perm.set(level)
         await ctx.send("The new permissions level has been set.")
+
+    @inviteset.command()
+    async def commandscope(self, ctx: commands.Context):
+        """
+        Add the `applications.commands` scope to your invite URL.
+
+        This allows the usage of slash commands on the servers that invited your bot with that scope.
+
+        Note that previous servers that invited the bot without the scope cannot have slash commands, they will have to invite the bot a second time.
+        """
+        enabled = not await self.bot._config.invite_commands_scope()
+        await self.bot._config.invite_commands_scope.set(enabled)
+        if enabled is True:
+            await ctx.send(
+                _("The `applications.commands` scope has been added to the invite URL.")
+            )
+        else:
+            await ctx.send(
+                _("The `applications.commands` scope has been removed from the invite URL.")
+            )
 
     @commands.command()
     @checks.is_owner()
@@ -2111,7 +2142,7 @@ class Core(commands.commands._RuleDropper, commands.Cog, CoreLogic):
         """
         Adds an admin role for this guild.
 
-        Admins have all the same access and Mods, plus additional admin level commands like:
+        Admins have the same access as Mods, plus additional admin level commands like:
          - `[p]set serverprefix`
          - `[p]addrole`
          - `[p]ban`
@@ -2667,6 +2698,23 @@ class Core(commands.commands._RuleDropper, commands.Cog, CoreLogic):
         **Arguments:**
             - `<prefixes...>` - The prefixes the bot will respond to globally.
         """
+        if any(len(x) > MAX_PREFIX_LENGTH for x in prefixes):
+            await ctx.send(
+                _(
+                    "Warning: A prefix is above the recommended length (20 characters).\n"
+                    "Do you want to continue? (y/n)"
+                )
+            )
+            pred = MessagePredicate.yes_or_no(ctx)
+            try:
+                await self.bot.wait_for("message", check=pred, timeout=30)
+            except asyncio.TimeoutError:
+                await ctx.send(_("Response timed out."))
+                return
+            else:
+                if pred.result is False:
+                    await ctx.send(_("Cancelled."))
+                    return
         await ctx.bot.set_prefixes(guild=None, prefixes=prefixes)
         if len(prefixes) == 1:
             await ctx.send(_("Prefix set."))
@@ -2682,6 +2730,7 @@ class Core(commands.commands._RuleDropper, commands.Cog, CoreLogic):
 
         Warning: This will override global prefixes, the bot will not respond to any global prefixes in this server.
             This is not additive. It will replace all current server prefixes.
+            A prefix cannot have more than 20 characters.
 
         **Examples:**
             - `[p]set serverprefix !`
@@ -2695,6 +2744,9 @@ class Core(commands.commands._RuleDropper, commands.Cog, CoreLogic):
         if not prefixes:
             await ctx.bot.set_prefixes(guild=ctx.guild, prefixes=[])
             await ctx.send(_("Server prefixes have been reset."))
+            return
+        if any(len(x) > MAX_PREFIX_LENGTH for x in prefixes):
+            await ctx.send(_("You cannot have a prefix longer than 20 characters."))
             return
         prefixes = sorted(prefixes, reverse=True)
         await ctx.bot.set_prefixes(guild=ctx.guild, prefixes=prefixes)
@@ -2788,7 +2840,7 @@ class Core(commands.commands._RuleDropper, commands.Cog, CoreLogic):
     @checks.is_owner()
     async def globalregionalformat(self, ctx: commands.Context, language_code: str = None):
         """
-        Changes bot's regional format. This is used for formatting date, time and numbers.
+        Changes the bot's regional format. This is used for formatting date, time and numbers.
 
         `language_code` can be any language code with country code included, e.g. `en-US`, `de-DE`, `fr-FR`, `pl-PL`, etc.
         Leave `language_code` empty to base regional formatting on bot's locale.
@@ -2830,7 +2882,7 @@ class Core(commands.commands._RuleDropper, commands.Cog, CoreLogic):
     @checks.guildowner_or_permissions(manage_guild=True)
     async def regionalformat(self, ctx: commands.Context, language_code: str = None):
         """
-        Changes bot's regional format in this server. This is used for formatting date, time and numbers.
+        Changes the bot's regional format in this server. This is used for formatting date, time and numbers.
 
         `language_code` can be any language code with country code included, e.g. `en-US`, `de-DE`, `fr-FR`, `pl-PL`, etc.
         Leave `language_code` empty to base regional formatting on bot's locale in this server.
@@ -3061,8 +3113,8 @@ class Core(commands.commands._RuleDropper, commands.Cog, CoreLogic):
         Using this without a setting will toggle.
 
          **Examples:**
-            - `[p]helpset usemenues True` - Enables using menus.
-            - `[p]helpset usemenues` - Toggles the value.
+            - `[p]helpset usemenus True` - Enables using menus.
+            - `[p]helpset usemenus` - Toggles the value.
 
         **Arguments:**
             - `[use_menus]` - Whether to use menus. Leave blank to toggle.
@@ -3507,19 +3559,20 @@ class Core(commands.commands._RuleDropper, commands.Cog, CoreLogic):
         IS_MAC = sys.platform == "darwin"
         IS_LINUX = sys.platform == "linux"
 
-        pyver = "{}.{}.{} ({})".format(*sys.version_info[:3], platform.architecture()[0])
+        python_version = ".".join(map(str, sys.version_info[:3]))
+        pyver = f"{python_version} ({platform.architecture()[0]})"
         pipver = pip.__version__
         redver = red_version_info
         dpy_version = discord.__version__
         if IS_WINDOWS:
             os_info = platform.uname()
-            osver = "{} {} (version {})".format(os_info.system, os_info.release, os_info.version)
+            osver = f"{os_info.system} {os_info.release} (version {os_info.version})"
         elif IS_MAC:
             os_info = platform.mac_ver()
-            osver = "Mac OSX {} {}".format(os_info[0], os_info[2])
+            osver = f"Mac OSX {os_info[0]} {os_info[2]}"
         elif IS_LINUX:
             os_info = distro.linux_distribution()
-            osver = "{} {}".format(os_info[0], os_info[1]).strip()
+            osver = f"{os_info[0]} {os_info[1]}".strip()
         else:
             osver = "Could not parse OS, report this on Github."
         user_who_ran = getpass.getuser()
@@ -3536,51 +3589,69 @@ class Core(commands.commands._RuleDropper, commands.Cog, CoreLogic):
             )
             or "None"
         )
-        if await ctx.embed_requested():
-            e = discord.Embed(color=await ctx.embed_colour())
-            e.title = "Debug Info for Red"
-            e.add_field(name="Red version", value=redver, inline=True)
-            e.add_field(name="Python version", value=pyver, inline=True)
-            e.add_field(name="Discord.py version", value=dpy_version, inline=True)
-            e.add_field(name="Pip version", value=pipver, inline=True)
-            e.add_field(name="System arch", value=platform.machine(), inline=True)
-            e.add_field(name="User", value=user_who_ran, inline=True)
-            e.add_field(name="Storage type", value=driver, inline=True)
-            e.add_field(name="Disabled intents", value=disabled_intents, inline=True)
-            e.add_field(name="OS version", value=osver, inline=False)
-            e.add_field(
-                name="Python executable",
-                value=escape(sys.executable, formatting=True),
-                inline=False,
-            )
-            e.add_field(
-                name="Data path",
-                value=escape(str(data_path), formatting=True),
-                inline=False,
-            )
-            e.add_field(
-                name="Metadata file",
-                value=escape(str(config_file), formatting=True),
-                inline=False,
-            )
-            await ctx.send(embed=e)
-        else:
-            info = (
-                "Debug Info for Red\n\n"
-                + "Red version: {}\n".format(redver)
-                + "Python version: {}\n".format(pyver)
-                + "Discord.py version: {}\n".format(dpy_version)
-                + "Pip version: {}\n".format(pipver)
-                + "System arch: {}\n".format(platform.machine())
-                + "User: {}\n".format(user_who_ran)
-                + "OS version: {}\n".format(osver)
-                + "Storage type: {}\n".format(driver)
-                + "Disabled intents: {}\n".format(disabled_intents)
-                + "Python executable: {}\n".format(sys.executable)
-                + "Data path: {}\n".format(data_path)
-                + "Metadata file: {}\n".format(config_file)
-            )
-            await ctx.send(box(info))
+
+        def _datasize(num: int):
+            for unit in ["B", "KB", "MB", "GB", "TB", "PB", "EB", "ZB"]:
+                if abs(num) < 1024.0:
+                    return "{0:.1f}{1}".format(num, unit)
+                num /= 1024.0
+            return "{0:.1f}{1}".format(num, "YB")
+
+        memory_ram = psutil.virtual_memory()
+        ram_string = "{used}/{total} ({percent}%)".format(
+            used=_datasize(memory_ram.used),
+            total=_datasize(memory_ram.total),
+            percent=memory_ram.percent,
+        )
+
+        owners = []
+        for uid in self.bot.owner_ids:
+            try:
+                u = await self.bot.get_or_fetch_user(uid)
+                owners.append(f"{u.id} ({u})")
+            except discord.HTTPException:
+                owners.append(f"{uid} (Unresolvable)")
+        owners_string = ", ".join(owners) or "None"
+
+        resp_intro = "# Debug Info for Red:"
+        resp_system_intro = "## System Metadata:"
+        resp_system = (
+            f"CPU Cores: {psutil.cpu_count()} ({platform.machine()})\nRAM: {ram_string}\n"
+        )
+        resp_os_intro = "## OS Variables:"
+        resp_os = f"OS version: {osver}\nUser: {user_who_ran}\n"  # Ran where off to?!
+        resp_py_metadata = (
+            f"Python executable: {sys.executable}\n"
+            f"Python version: {pyver}\n"
+            f"Pip version: {pipver}\n"
+        )
+        resp_red_metadata = f"Red version: {redver}\nDiscord.py version: {dpy_version}\n"
+        resp_red_vars_intro = "## Red variables:"
+        resp_red_vars = (
+            f"Instance name: {data_manager.instance_name}\n"
+            f"Owner(s): {owners_string}\n"
+            f"Storage type: {driver}\n"
+            f"Disabled intents: {disabled_intents}\n"
+            f"Data path: {data_path}\n"
+            f"Metadata file: {config_file}"
+        )
+
+        response = (
+            box(resp_intro, lang="md"),
+            "\n",
+            box(resp_system_intro, lang="md"),
+            box(resp_system),
+            "\n",
+            box(resp_os_intro, lang="md"),
+            box(resp_os),
+            box(resp_py_metadata),
+            box(resp_red_metadata),
+            "\n",
+            box(resp_red_vars_intro, lang="md"),
+            box(resp_red_vars),
+        )
+
+        await ctx.send("".join(response))
 
     @commands.group(aliases=["whitelist"])
     @checks.is_owner()
@@ -3884,7 +3955,7 @@ class Core(commands.commands._RuleDropper, commands.Cog, CoreLogic):
         """
         Clears the allowlist.
 
-        This disables the local allowlist and clears all entires.
+        This disables the local allowlist and clears all entries.
 
         **Example:**
             - `[p]localallowlist clear`
@@ -3969,7 +4040,7 @@ class Core(commands.commands._RuleDropper, commands.Cog, CoreLogic):
         self, ctx: commands.Context, *users_or_roles: Union[discord.Member, discord.Role, int]
     ):
         """
-        Removes user or role from blocklist.
+        Removes user or role from local blocklist.
 
         **Examples:**
             - `[p]localblocklist remove @26 @Will` - Removes two users from the local blocklist.
@@ -3993,7 +4064,7 @@ class Core(commands.commands._RuleDropper, commands.Cog, CoreLogic):
         """
         Clears the server blocklist.
 
-        This disabled the server blocklist and clears all entries.
+        This disables the server blocklist and clears all entries.
 
         **Example:**
             - `[p]blocklist clear`
@@ -4261,12 +4332,12 @@ class Core(commands.commands._RuleDropper, commands.Cog, CoreLogic):
         """
         Disable a command in this server only.
 
-                **Examples:**
-                    - `[p]command disable server userinfo` - Disables the `userinfo` command in the Mod cog.
-                    - `[p]command disable server urban` - Disables the `urban` command in the General cog.
+        **Examples:**
+            - `[p]command disable server userinfo` - Disables the `userinfo` command in the Mod cog.
+            - `[p]command disable server urban` - Disables the `urban` command in the General cog.
 
-                **Arguments:**
-                    - `<command>` - The command to disable for the current server.
+        **Arguments:**
+            - `<command>` - The command to disable for the current server.
         """
         command_obj: Optional[commands.Command] = ctx.bot.get_command(command)
         if command_obj is None:
@@ -4325,7 +4396,7 @@ class Core(commands.commands._RuleDropper, commands.Cog, CoreLogic):
     @command_enable.command(name="global")
     async def command_enable_global(self, ctx: commands.Context, *, command: str):
         """
-                Enable a command globally.
+        Enable a command globally.
 
         **Examples:**
             - `[p]command enable global userinfo` - Enables the `userinfo` command in the Mod cog.
@@ -4472,7 +4543,7 @@ class Core(commands.commands._RuleDropper, commands.Cog, CoreLogic):
         self, ctx: commands.Context, *, user_or_role: Union[discord.Member, discord.Role]
     ):
         """
-        Makes a user or role immune from automated moderation actions.
+        Remove a user or role from being immune to automated moderation actions.
 
         **Examples:**
             - `[p]autoimmune remove @TwentySix` - Removes a user.
